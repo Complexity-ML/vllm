@@ -176,14 +176,31 @@ class TokenRoutedMLP(nn.Module):
             else:
                 expert_ids = base_expert_ids
 
-        gate_up_weights = self.gate_up_proj[expert_ids]
-        down_weights = self.down_proj[expert_ids]
+        # Memory-efficient: process by expert groups instead of per-token bmm
+        output = torch.zeros(num_tokens, self.hidden_size, device=x.device, dtype=x.dtype)
 
-        gate_up_out = torch.bmm(x.unsqueeze(1), gate_up_weights).squeeze(1)
-        gate_out = gate_up_out[..., :self.expert_intermediate_size]
-        up_out = gate_up_out[..., self.expert_intermediate_size:]
-        intermediate = F.silu(gate_out) * up_out
-        output = torch.bmm(intermediate.unsqueeze(1), down_weights).squeeze(1)
+        for expert_id in range(self.num_experts):
+            # Find tokens routed to this expert
+            mask = expert_ids == expert_id
+            if not mask.any():
+                continue
+
+            # Get tokens for this expert
+            x_expert = x[mask]  # [num_tokens_for_expert, hidden_size]
+
+            # Get expert weights
+            gate_up_w = self.gate_up_proj[expert_id]  # [hidden_size, 2*intermediate]
+            down_w = self.down_proj[expert_id]  # [intermediate, hidden_size]
+
+            # Forward through expert (matmul instead of bmm)
+            gate_up_out = x_expert @ gate_up_w  # [n, 2*intermediate]
+            gate_out = gate_up_out[..., :self.expert_intermediate_size]
+            up_out = gate_up_out[..., self.expert_intermediate_size:]
+            intermediate = F.silu(gate_out) * up_out  # [n, intermediate]
+            expert_output = intermediate @ down_w  # [n, hidden_size]
+
+            # Scatter back to output
+            output[mask] = expert_output
 
         return output
 
@@ -476,10 +493,12 @@ class ComplexityModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
 
+        # Handle prefix correctly (avoid leading dot when prefix is empty)
+        embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            prefix=f"{prefix}.embed_tokens",
+            prefix=embed_prefix,
         )
 
         self.layers = nn.ModuleList([
@@ -487,7 +506,7 @@ class ComplexityModel(nn.Module):
                 config=config,
                 cache_config=cache_config,
                 quant_config=quant_config,
-                prefix=f"{prefix}.layers.{i}",
+                prefix=f"{prefix}.layers.{i}" if prefix else f"layers.{i}",
             )
             for i in range(config.num_hidden_layers)
         ])
@@ -567,19 +586,23 @@ class ComplexityForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
+        # Handle prefix correctly (avoid leading dot when prefix is empty)
+        model_prefix = f"{prefix}.model" if prefix else "model"
+
         self.model = ComplexityModel(
             vllm_config=vllm_config,
-            prefix=f"{prefix}.model",
+            prefix=model_prefix,
         )
 
         if getattr(config, "tie_word_embeddings", True):
             self.lm_head = self.model.embed_tokens
         else:
+            lm_head_prefix = f"{prefix}.lm_head" if prefix else "lm_head"
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                prefix=f"{prefix}.lm_head",
+                prefix=lm_head_prefix,
             )
 
     def forward(
@@ -636,11 +659,26 @@ class ComplexityForCausalLM(nn.Module):
                 loaded_params.add(orig_name)
                 continue
 
-            # Map lm_head.weight to embed_tokens for tied embeddings
+            # Handle tied embeddings: both lm_head.weight and model.embed_tokens.weight
+            # map to the same parameter (model.embed_tokens.weight)
             if name == "lm_head.weight":
                 embed_name = "model.embed_tokens.weight"
                 if embed_name in params_dict:
                     param = params_dict[embed_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(orig_name)
+                    # Mark embed_tokens as loaded too (tied embeddings)
+                    loaded_params.add(embed_name)
+                continue
+
+            # Skip model.embed_tokens.weight if already loaded via lm_head.weight (tied)
+            if name == "model.embed_tokens.weight":
+                if name in loaded_params:
+                    continue
+                # If not yet loaded, load it directly
+                if name in params_dict:
+                    param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
                     loaded_params.add(orig_name)
