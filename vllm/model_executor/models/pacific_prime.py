@@ -608,10 +608,12 @@ class ComplexityForCausalLM(nn.Module):
 
         Pacific-Prime checkpoint structure:
         - lm_head.weight -> model.embed_tokens.weight (tied embeddings)
+        - self_attn.q_proj, k_proj, v_proj -> qkv_proj (stacked)
         - layers.*.mlp.gate_up_proj -> TokenRoutedMLP expert weights (fused)
         - layers.*.mlp.down_proj -> TokenRoutedMLP expert weights
         - layers.*.mlp.token_to_expert -> buffer (not a parameter)
         """
+        # QKV stacking: checkpoint has separate q/k/v, model has fused qkv_proj
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -625,9 +627,21 @@ class ComplexityForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             orig_name = name
 
+            # Skip rotary_emb.inv_freq - vLLM computes this
+            if "rotary_emb.inv_freq" in name:
+                loaded_params.add(orig_name)
+                continue
+
             # Map lm_head.weight to embed_tokens for tied embeddings
             if name == "lm_head.weight":
-                name = "model.embed_tokens.weight"
+                # Find embed_tokens in params_dict
+                embed_name = "model.embed_tokens.weight"
+                if embed_name in params_dict:
+                    param = params_dict[embed_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(orig_name)
+                continue
 
             # Handle token_to_expert buffer
             if "token_to_expert" in name:
@@ -646,10 +660,12 @@ class ComplexityForCausalLM(nn.Module):
                     loaded_params.add(orig_name)
                 continue
 
-            # Handle stacked params (QKV)
+            # Handle stacked params (QKV): q_proj, k_proj, v_proj -> qkv_proj
+            handled = False
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue
+                # Replace q_proj/k_proj/v_proj with qkv_proj in the name
                 stacked_name = name.replace(shard_name, param_name)
                 if stacked_name not in params_dict:
                     continue
@@ -657,15 +673,19 @@ class ComplexityForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(orig_name)
+                handled = True
                 break
-            else:
-                # Direct parameter loading
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(orig_name)
+
+            if handled:
+                continue
+
+            # Direct parameter loading
+            if name not in params_dict:
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(orig_name)
 
         return loaded_params
 
