@@ -786,3 +786,8 @@ class ComplexityForCausalLM(nn.Module):
                 loaded_params.add(name)
 
         return loaded_params
+
+
+# Alias for HuggingFace compatibility
+# The model on HuggingFace uses "DeepForCausalLM" as architecture name
+DeepForCausalLM = ComplexityForCausalLM
