@@ -29,8 +29,8 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -261,15 +261,27 @@ class ComplexityAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
 
-        # QKV projection
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=num_heads,
-            total_num_kv_heads=num_kv_heads,
+        # Separate Q/K/V projections (mirrors checkpoint structure)
+        self.q_proj = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=num_heads * self.head_dim,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=f"{prefix}.q_proj",
+        )
+        self.k_proj = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k_proj",
+        )
+        self.v_proj = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.v_proj",
         )
 
         # Mu-guided projections
@@ -320,8 +332,9 @@ class ComplexityAttention(nn.Module):
         hidden_states: torch.Tensor,
         mu_prev: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, _ = self.q_proj(hidden_states)
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
 
         # Mu-guidance
         if mu_prev is not None:
@@ -527,13 +540,11 @@ class ComplexityForCausalLM(nn.Module):
     Compatible with vLLM inference engine.
     """
 
-    packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
+    # No packed modules - Q/K/V are separate, MLP uses TokenRoutedMLP
+    packed_modules_mapping = {}
 
     supported_lora_modules = [
-        "qkv_proj", "o_proj", "gate_up_proj", "down_proj",
+        "q_proj", "k_proj", "v_proj", "o_proj",
     ]
 
     embedding_modules = {
@@ -606,20 +617,13 @@ class ComplexityForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         """Load weights from checkpoint.
 
-        Pacific-Prime checkpoint structure:
+        Pacific-Prime checkpoint structure mirrors model exactly:
         - lm_head.weight -> model.embed_tokens.weight (tied embeddings)
-        - self_attn.q_proj, k_proj, v_proj -> qkv_proj (stacked)
-        - layers.*.mlp.gate_up_proj -> TokenRoutedMLP expert weights (fused)
+        - self_attn.q_proj, k_proj, v_proj (separate, not fused)
+        - layers.*.mlp.gate_up_proj -> TokenRoutedMLP expert weights
         - layers.*.mlp.down_proj -> TokenRoutedMLP expert weights
         - layers.*.mlp.token_to_expert -> buffer (not a parameter)
         """
-        # QKV stacking: checkpoint has separate q/k/v, model has fused qkv_proj
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
         loaded_params: Set[str] = set()
@@ -634,7 +638,6 @@ class ComplexityForCausalLM(nn.Module):
 
             # Map lm_head.weight to embed_tokens for tied embeddings
             if name == "lm_head.weight":
-                # Find embed_tokens in params_dict
                 embed_name = "model.embed_tokens.weight"
                 if embed_name in params_dict:
                     param = params_dict[embed_name]
@@ -645,13 +648,12 @@ class ComplexityForCausalLM(nn.Module):
 
             # Handle token_to_expert buffer
             if "token_to_expert" in name:
-                buf_name = name
-                if buf_name in buffers_dict:
-                    buffers_dict[buf_name].copy_(loaded_weight)
+                if name in buffers_dict:
+                    buffers_dict[name].copy_(loaded_weight)
                     loaded_params.add(orig_name)
                 continue
 
-            # Handle TokenRoutedMLP weights (already fused in checkpoint)
+            # Handle TokenRoutedMLP weights (expert weights with shape [num_experts, ...])
             if ".mlp.gate_up_proj" in name or ".mlp.down_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
@@ -660,26 +662,7 @@ class ComplexityForCausalLM(nn.Module):
                     loaded_params.add(orig_name)
                 continue
 
-            # Handle stacked params (QKV): q_proj, k_proj, v_proj -> qkv_proj
-            handled = False
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if shard_name not in name:
-                    continue
-                # Replace q_proj/k_proj/v_proj with qkv_proj in the name
-                stacked_name = name.replace(shard_name, param_name)
-                if stacked_name not in params_dict:
-                    continue
-                param = params_dict[stacked_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(orig_name)
-                handled = True
-                break
-
-            if handled:
-                continue
-
-            # Direct parameter loading
+            # Direct parameter loading (q_proj, k_proj, v_proj, o_proj, norms, etc.)
             if name not in params_dict:
                 continue
             param = params_dict[name]
