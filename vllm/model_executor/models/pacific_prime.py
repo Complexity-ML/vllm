@@ -33,7 +33,6 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -289,13 +288,12 @@ class ComplexityAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        # RoPE
+        # RoPE - vLLM v1 API
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
-            base=rope_theta,
             is_neox_style=True,
+            rope_parameters={"base": rope_theta},
         )
 
         # QK Norm
@@ -486,11 +484,15 @@ class ComplexityModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(input_ids)
         velocity_states = torch.zeros_like(hidden_states)
 
         mu_prev = None
@@ -569,71 +571,101 @@ class ComplexityForCausalLM(nn.Module):
                 prefix=f"{prefix}.lm_head",
             )
 
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
+            inputs_embeds=inputs_embeds,
             intermediate_tensors=intermediate_tensors,
         )
         return hidden_states
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed input tokens - required for vLLM v1 generate runner."""
+        return self.model.embed_tokens(input_ids)
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+        """Compute logits from hidden states - vLLM v1 API."""
+        # vLLM v1 uses simpler logits computation
+        if isinstance(self.lm_head, VocabParallelEmbedding):
+            # Tied embeddings case
+            logits = F.linear(hidden_states, self.lm_head.weight)
+        else:
+            logits = self.lm_head(hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        """Load weights from checkpoint."""
+        """Load weights from checkpoint.
+
+        Pacific-Prime checkpoint structure:
+        - lm_head.weight -> model.embed_tokens.weight (tied embeddings)
+        - layers.*.mlp.gate_up_proj -> TokenRoutedMLP expert weights (fused)
+        - layers.*.mlp.down_proj -> TokenRoutedMLP expert weights
+        - layers.*.mlp.token_to_expert -> buffer (not a parameter)
+        """
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters())
+        buffers_dict = dict(self.named_buffers())
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
-            # Handle Token-Routed MLP expert weights
-            if "mlp.gate_proj" in name or "mlp.up_proj" in name or "mlp.down_proj" in name:
-                if name in params_dict:
-                    param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
+            orig_name = name
+
+            # Map lm_head.weight to embed_tokens for tied embeddings
+            if name == "lm_head.weight":
+                name = "model.embed_tokens.weight"
+
+            # Handle token_to_expert buffer
+            if "token_to_expert" in name:
+                buf_name = name
+                if buf_name in buffers_dict:
+                    buffers_dict[buf_name].copy_(loaded_weight)
+                    loaded_params.add(orig_name)
                 continue
 
-            # Handle stacked params
+            # Handle TokenRoutedMLP weights (already fused in checkpoint)
+            if ".mlp.gate_up_proj" in name or ".mlp.down_proj" in name:
+                if name in params_dict:
+                    param = params_dict[name]
+                    with torch.no_grad():
+                        param.copy_(loaded_weight)
+                    loaded_params.add(orig_name)
+                continue
+
+            # Handle stacked params (QKV)
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue
-                name = name.replace(shard_name, param_name)
-                if name not in params_dict:
+                stacked_name = name.replace(shard_name, param_name)
+                if stacked_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[stacked_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
+                loaded_params.add(orig_name)
                 break
             else:
+                # Direct parameter loading
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                loaded_params.add(orig_name)
 
         return loaded_params
 
