@@ -89,6 +89,8 @@ _TEXT_GENERATION_MODELS = {
     "CwmForCausalLM": ("llama", "LlamaForCausalLM"),
     "DbrxForCausalLM": ("dbrx", "DbrxForCausalLM"),
     "DeciLMForCausalLM": ("nemotron_nas", "DeciLMForCausalLM"),
+    "DeepForCausalLM": ("pacific_prime", "ComplexityForCausalLM"),  # Pacific-Prime
+    "ComplexityForCausalLM": ("pacific_prime", "ComplexityForCausalLM"),  # Pacific-Prime
     "DeepseekForCausalLM": ("deepseek_v2", "DeepseekForCausalLM"),
     "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2ForCausalLM"),
     "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
